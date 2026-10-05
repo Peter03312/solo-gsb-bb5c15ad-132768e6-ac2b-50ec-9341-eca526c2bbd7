@@ -18,6 +18,7 @@ const { requireAuth, requireRole } = require('../auth');
 const { recordAudit } = require('../audit');
 const {
   ValidationError,
+  ConflictError,
   assertDate,
   positiveNumber,
   nonEmptyString,
@@ -27,6 +28,7 @@ const {
   lockExhibit,
   getHallByCode,
   getResidencesIntersecting,
+  collectSharedLightingAllocations,
   registerSharedLighting,
   loadSharedLightingView,
   getOccupyingPlans,
@@ -35,6 +37,20 @@ const {
 const { wallToTs, tsToWallString, doseByYear, yearMapToObject } = require('../dosing');
 
 const router = express.Router();
+
+/**
+ * 归属集合在加锁后发生变化（预读驻留后、正式归属前有另一笔驻留登记/迁入完成）：
+ * 本次事务尚未写入任何业务数据，整体放弃并按最新驻留集合重新取锁重试。
+ */
+class AllocationSetChangedError extends Error {
+  constructor(freshExhibitIds) {
+    super('共享照明归属展品集合已变化，需要按最新驻留重新加锁');
+    this.name = 'AllocationSetChangedError';
+    this.freshExhibitIds = freshExhibitIds;
+  }
+}
+
+const MAX_ATTRIBUTION_RETRIES = 8;
 
 router.use(requireAuth);
 
@@ -135,18 +151,23 @@ function parseSharedLightingBody(body) {
 
 /**
  * 保管员登记一次展厅共享照明。
- * 流程（按“展厅键 → 各展品键”的全局键序在同一事务内原子执行）：
- *  1) 展厅存在；照明与该展厅驻留区间有交集（registerSharedLighting 内复核，无交集 409）；
- *  2) 归属切分 + 冲突收集（未作废实测/停灯/事故），有冲突整次拒绝 409、不落库；
- *  3) 原子写入共享照明与各展品归属段，逐展品重算年度占用；
+ * 流程（按“展厅键 → 各最终归属展品键”的全局键序在同一事务内原子执行）：
+ *  0) 事务外仅做输入校验与展厅存在性/有无驻留交集的快速失败（不决定最终归属）；
+ *  1) 事务内先锁展厅行，再按“登记生效时与照明时段相交的驻留”重新切分归属——
+ *     若预读驻留后、正式归属前有另一笔驻留登记/迁入（或驻留删除/迁出）完成，
+ *     最终归属集合以锁内快照为准；预读加锁集合未覆盖新归属展品时整事务放弃
+ *     （尚无任何写入），按最新集合重新取锁重试，绝不把照明归到新展品却只处理旧展品；
+ *  2) 对全部最终归属展品按 id 升序加展品键锁/行锁，归属切分 + 冲突收集
+ *     （未作废实测/停灯/事故），任一展品有冲突整次拒绝 409、不留任何部分记录；
+ *  3) 原子写入共享照明与各展品归属段，对全部归属展品逐展品重算年度占用与分级预警；
  *  4) 超限仍入账：返回各展品超额年份，并把相关年度仍有估算残余且尚未开始的已批准计划
- *     转待复核（原因注明由共享照明触发）。
+ *     转待复核（原因注明由共享照明触发）；无法对最终归属集合一致入账时整体回滚不提交。
  */
 router.post('/', requireRole('conservator'), async (req, res, next) => {
   try {
     const input = parseSharedLightingBody(req.body || {});
 
-    // 预读展厅与受影响展品（真正的校验在锁事务内重算）
+    // 预读仅用于快速失败与首轮加锁范围；真正的归属集合在锁事务内确定。
     const hall = await getHallByCode({ query }, input.hallCode);
     if (!hall) throw new ValidationError(`展厅「${input.hallCode}」不存在，请先登记该展厅的展品驻留`);
     const preResidences = await getResidencesIntersecting(
@@ -158,153 +179,200 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
         '与该展厅任何展品的驻留区间都没有交集，无法归属，已拒绝'
       );
     }
-    const exhibitIds = [...new Set(preResidences.map((r) => Number(r.exhibit_id)))]
+    let candidateExhibitIds = [...new Set(preResidences.map((r) => Number(r.exhibit_id)))]
       .sort((a, b) => a - b);
 
-    const out = await withOrderedKeyTransaction(
-      [`hall:${hall.id}`, ...exhibitIds.map((id) => `exhibit:${id}`)],
-      async (client) => {
-        await client.query('SELECT id FROM halls WHERE id = $1 FOR UPDATE', [hall.id]);
-        for (const exId of exhibitIds) {
-          await lockExhibit(client, exId);
-        }
+    // 若另一笔驻留登记/迁入恰在“预读驻留后、正式归属前”完成，放弃本轮（尚未写入任何数据），
+    // 按锁内读到的最新归属集合重新取锁后重试；锁序恒为展厅 → 展品 id 升序，不会循环等待。
+    let out;
+    let attempt = 0;
+    for (;;) {
+      attempt += 1;
+      try {
+        out = await withOrderedKeyTransaction(
+          [`hall:${hall.id}`, ...candidateExhibitIds.map((id) => `exhibit:${id}`)],
+          async (client) => {
+            await client.query('SELECT id FROM halls WHERE id = $1 FOR UPDATE', [hall.id]);
 
-        const { session, allocations } = await registerSharedLighting(
-          client,
-          { hallId: hall.id, startMs: input.startMs, endMs: input.endMs,
-            actualLux: input.actualLux, reason: input.reason },
-          req.sessionUser
-        );
-        const sessionId = Number(session.id);
-
-        // 整次共享照明按年剂量（审计用）
-        const sessionYearly = yearMapToObject(
-          doseByYear([{ start: input.startMs, end: input.endMs }], input.actualLux)
-        );
-        await recordAudit(client, req.sessionUser, 'shared_lighting.create',
-          'shared_lighting', sessionId, {
-            hallId: Number(hall.id),
-            hallCode: input.hallCode,
-            start: tsToWallString(input.startMs),
-            end: tsToWallString(input.endMs),
-            actualLux: input.actualLux,
-            reason: input.reason,
-            sessionYearly,
-            exhibitIds,
-            allocations: allocations.map((a) => ({
-              exhibitId: a.exhibitId, residenceId: a.residenceId,
-              start: tsToWallString(a.start), end: tsToWallString(a.end), yearly: a.yearly,
-            })),
-          });
-
-        // 逐展品局部重算本次归属剂量影响到的年份并收集超额；超限仍入账。
-        const { recomputeExhibitUsage, refreshUsageYears } = require('../usage');
-        const overflowsByExhibit = [];
-        const flaggedPlansByExhibit = [];
-        const alertEventsByExhibit = [];
-        const exhibitDetails = [];
-        for (const exId of exhibitIds) {
-          const allocsHere = allocations.filter((a) => a.exhibitId === exId);
-          const candidateYears = new Set();
-          for (const a of allocsHere) for (const y of Object.keys(a.yearly)) candidateYears.add(Number(y));
-          const affectedYears = [...candidateYears];
-
-          // 阶段一：先按新入账的归属重算派生占用（同事务、仅限受影响年份，不写预警事件）。
-          let occupancy = await refreshUsageYears(client, exId, affectedYears);
-
-          const overflows = [];
-          const overflowYears = [];
-          for (const year of candidateYears) {
-            const info = occupancy.years[String(year)];
-            if (!info || info.limit === null) continue;
-            if (info.over) {
-              overflowYears.push(Number(year));
-              overflows.push({
-                year: Number(year),
-                limit: info.limit,
-                projected: info.used,
-                excess: Math.round((info.used - info.limit) * 1000) / 1000,
-              });
-            }
-          }
-          overflowsByExhibit.push({ exhibitId: exId, overflows });
-
-          if (overflowYears.length > 0) {
-            const activePlans = await getOccupyingPlans(client, exId);
-            const targets = plansToFlag(activePlans, occupancy, overflowYears, Date.now());
-            for (const { plan: fp, firstStart } of targets) {
-              const reason =
-                `共享照明 #${sessionId}（展厅「${input.hallCode}」，${tsToWallString(input.startMs)} ~ ` +
-                `${tsToWallString(input.endMs)}）登记后导致 ${overflowYears.join('、')} 年额度超限，转待复核`;
-              await client.query(
-                `UPDATE plans
-                    SET status = 'pending_review', review_reason = $2, updated_at = now()
-                  WHERE id = $1 AND status = 'approved'`,
-                [fp.id, reason]
+            // 最终归属按登记生效时（持展厅行锁、驻留不可能再变）与照明时段相交的驻留确定。
+            const allocations = await collectSharedLightingAllocations(
+              client,
+              { hallId: hall.id, startMs: input.startMs, endMs: input.endMs }
+            );
+            if (allocations.length === 0) {
+              throw new ValidationError(
+                `共享照明时段 ${tsToWallString(input.startMs)} ~ ${tsToWallString(input.endMs)} ` +
+                '与该展厅任何展品的驻留区间都没有交集，无法归属，已拒绝'
               );
-              await recordAudit(client, req.sessionUser, 'plan.flag_review_shared_lighting',
-                'plan', fp.id, { triggerSharedLightingId: sessionId, overflowYears });
-              flaggedPlansByExhibit.push({
-                exhibitId: exId,
-                id: fp.id,
-                title: fp.title,
-                firstStart: tsToWallString(firstStart),
-                overflowYears,
+            }
+            const finalExhibitIds = [...new Set(allocations.map((a) => a.exhibitId))]
+              .sort((a, b) => a - b);
+
+            // 本轮已持展品键锁必须覆盖全部最终归属展品；未覆盖（预读后有新驻留/迁入）
+            // 则放弃本轮，外层按 finalExhibitIds 重新取锁。此处尚无任何业务写入，
+            // 抛错仅导致空事务回滚，不留部分记录。
+            const covered = new Set(candidateExhibitIds);
+            if (finalExhibitIds.some((id) => !covered.has(id))) {
+              throw new AllocationSetChangedError(finalExhibitIds);
+            }
+            // 仅对最终归属展品补展品行锁（候选集可能含预读后迁出的展品，多锁无害）。
+            for (const exId of finalExhibitIds) {
+              await lockExhibit(client, exId);
+            }
+
+            // 展厅行锁持续到提交，驻留集合在此刻之后不可能再变；归属即为最终归属。
+            const { session, allocations: finalAllocations } = await registerSharedLighting(
+              client,
+              { hallId: hall.id, startMs: input.startMs, endMs: input.endMs,
+                actualLux: input.actualLux, reason: input.reason, allocations },
+              req.sessionUser
+            );
+            const sessionId = Number(session.id);
+            const exhibitIds = finalExhibitIds;
+
+            // 整次共享照明按年剂量（审计用）
+            const sessionYearly = yearMapToObject(
+              doseByYear([{ start: input.startMs, end: input.endMs }], input.actualLux)
+            );
+            await recordAudit(client, req.sessionUser, 'shared_lighting.create',
+              'shared_lighting', sessionId, {
+                hallId: Number(hall.id),
+                hallCode: input.hallCode,
+                start: tsToWallString(input.startMs),
+                end: tsToWallString(input.endMs),
+                actualLux: input.actualLux,
+                reason: input.reason,
+                sessionYearly,
+                exhibitIds,
+                allocations: finalAllocations.map((a) => ({
+                  exhibitId: a.exhibitId, residenceId: a.residenceId,
+                  start: tsToWallString(a.start), end: tsToWallString(a.end), yearly: a.yearly,
+                })),
               });
+
+            // 逐展品局部重算本次归属剂量影响到的年份并收集超额；超限仍入账。
+            const { recomputeExhibitUsage, refreshUsageYears } = require('../usage');
+            const overflowsByExhibit = [];
+            const flaggedPlansByExhibit = [];
+            const alertEventsByExhibit = [];
+            const exhibitDetails = [];
+            for (const exId of exhibitIds) {
+              const allocsHere = finalAllocations.filter((a) => a.exhibitId === exId);
+              const candidateYears = new Set();
+              for (const a of allocsHere) for (const y of Object.keys(a.yearly)) candidateYears.add(Number(y));
+              const affectedYears = [...candidateYears];
+
+              // 阶段一：先按新入账的归属重算派生占用（同事务、仅限受影响年份，不写预警事件）。
+              let occupancy = await refreshUsageYears(client, exId, affectedYears);
+
+              const overflows = [];
+              const overflowYears = [];
+              for (const year of candidateYears) {
+                const info = occupancy.years[String(year)];
+                if (!info || info.limit === null) continue;
+                if (info.over) {
+                  overflowYears.push(Number(year));
+                  overflows.push({
+                    year: Number(year),
+                    limit: info.limit,
+                    projected: info.used,
+                    excess: Math.round((info.used - info.limit) * 1000) / 1000,
+                  });
+                }
+              }
+              overflowsByExhibit.push({ exhibitId: exId, overflows });
+
+              if (overflowYears.length > 0) {
+                const activePlans = await getOccupyingPlans(client, exId);
+                const targets = plansToFlag(activePlans, occupancy, overflowYears, Date.now());
+                for (const { plan: fp, firstStart } of targets) {
+                  const reason =
+                    `共享照明 #${sessionId}（展厅「${input.hallCode}」，${tsToWallString(input.startMs)} ~ ` +
+                    `${tsToWallString(input.endMs)}）登记后导致 ${overflowYears.join('、')} 年额度超限，转待复核`;
+                  await client.query(
+                    `UPDATE plans
+                        SET status = 'pending_review', review_reason = $2, updated_at = now()
+                      WHERE id = $1 AND status = 'approved'`,
+                    [fp.id, reason]
+                  );
+                  await recordAudit(client, req.sessionUser, 'plan.flag_review_shared_lighting',
+                    'plan', fp.id, { triggerSharedLightingId: sessionId, overflowYears });
+                  flaggedPlansByExhibit.push({
+                    exhibitId: exId,
+                    id: fp.id,
+                    title: fp.title,
+                    firstStart: tsToWallString(firstStart),
+                    overflowYears,
+                  });
+                }
+              }
+
+              // 阶段二：待复核转态完成后，以最终占用再局部重算一次派生占用并判定预警边沿
+              // （同一多展品事务；整次登记回滚时归属/计划状态/派生占用/预警事件一并回滚）。
+              const { occupancy: finalOcc, events } = await recomputeExhibitUsage(
+                client, exId, affectedYears, {
+                  actor: req.sessionUser,
+                  trigger: {
+                    type: 'shared_lighting.create',
+                    detail: { sharedLightingId: sessionId, hallCode: input.hallCode },
+                  },
+                }
+              );
+              occupancy = finalOcc;
+              alertEventsByExhibit.push({ exhibitId: exId, events });
             }
+
+            // 刷新各展品详情（含被转待复核后的状态）
+            const { exhibitDetail } = require('./exhibits');
+            for (const exId of exhibitIds) {
+              exhibitDetails.push(await exhibitDetail(client, exId, { lock: true }));
+            }
+            const freshByExhibit = new Map();
+            for (const exId of exhibitIds) {
+              const view = await loadSharedLightingView(client, exId);
+              freshByExhibit.set(exId, view.items.find((x) => x.id === sessionId) || null);
+            }
+            const sharedLighting = exhibitIds.map((exId) => {
+              const item = freshByExhibit.get(exId);
+              return item ? serializeSharedLighting(item) : {
+                id: sessionId, hallId: Number(hall.id), hallCode: input.hallCode,
+                exhibitId: exId,
+                yearly: yearMapToObject(
+                  doseByYear(
+                    finalAllocations.filter((a) => a.exhibitId === exId)
+                      .map((a) => ({ start: a.start, end: a.end })),
+                    input.actualLux
+                  )
+                ),
+              };
+            });
+
+            return {
+              sessionId,
+              exhibitIds,
+              exhibitDetails,
+              sharedLighting,
+              overflowsByExhibit,
+              flaggedPlansByExhibit,
+              alertEventsByExhibit,
+            };
           }
-
-          // 阶段二：待复核转态完成后，以最终占用再局部重算一次派生占用并判定预警边沿
-          // （同一多展品事务；整次登记回滚时归属/计划状态/派生占用/预警事件一并回滚）。
-          const { occupancy: finalOcc, events } = await recomputeExhibitUsage(
-            client, exId, affectedYears, {
-              actor: req.sessionUser,
-              trigger: {
-                type: 'shared_lighting.create',
-                detail: { sharedLightingId: sessionId, hallCode: input.hallCode },
-              },
-            }
+        );
+        break; // 已按最终归属集合一致入账
+      } catch (err) {
+        if (err instanceof AllocationSetChangedError && attempt < MAX_ATTRIBUTION_RETRIES) {
+          candidateExhibitIds = err.freshExhibitIds;
+          continue;
+        }
+        if (err instanceof AllocationSetChangedError) {
+          // 理论上多轮重试后仍被新驻留插入的概率极低；明确拒绝，不留任何记录。
+          throw new ConflictError(
+            '共享照明登记失败：登记期间展厅驻留多次变化，无法对最终归属集合一致入账，整次登记未保存，请重试'
           );
-          occupancy = finalOcc;
-          alertEventsByExhibit.push({ exhibitId: exId, events });
         }
-
-        // 刷新各展品详情（含被转待复核后的状态）
-        const { exhibitDetail } = require('./exhibits');
-        for (const exId of exhibitIds) {
-          exhibitDetails.push(await exhibitDetail(client, exId, { lock: true }));
-        }
-        const freshByExhibit = new Map();
-        for (const exId of exhibitIds) {
-          const view = await loadSharedLightingView(client, exId);
-          freshByExhibit.set(exId, view.items.find((x) => x.id === sessionId) || null);
-        }
-        const sharedLighting = exhibitIds.map((exId) => {
-          const item = freshByExhibit.get(exId);
-          return item ? serializeSharedLighting(item) : {
-            id: sessionId, hallId: Number(hall.id), hallCode: input.hallCode,
-            exhibitId: exId,
-            yearly: yearMapToObject(
-              doseByYear(
-                allocations.filter((a) => a.exhibitId === exId)
-                  .map((a) => ({ start: a.start, end: a.end })),
-                input.actualLux
-              )
-            ),
-          };
-        });
-
-        return {
-          sessionId,
-          exhibitIds,
-          exhibitDetails,
-          sharedLighting,
-          overflowsByExhibit,
-          flaggedPlansByExhibit,
-          alertEventsByExhibit,
-        };
+        throw err;
       }
-    );
+    }
 
     const allOverflows = out.overflowsByExhibit.flatMap((o) =>
       o.overflows.map((x) => ({ exhibitId: o.exhibitId, ...x }))

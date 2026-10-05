@@ -31,7 +31,10 @@ pool.on('error', (err) => {
  * 实现：每个 key 维护一个 Promise 链尾，后来者先排队等待，结束后摘下自己。
  */
 const lockTails = new Map();
+// 每个键当前的临界区数量（含持锁者与排队者；测试同步用）。
+const lockActive = new Map();
 async function withKeyLock(key, work) {
+  lockActive.set(key, (lockActive.get(key) || 0) + 1);
   const prev = lockTails.get(key);
   let release;
   const mine = new Promise((resolve) => {
@@ -54,6 +57,9 @@ async function withKeyLock(key, work) {
     return await work();
   } finally {
     release();
+    const remaining = Math.max(0, (lockActive.get(key) || 1) - 1);
+    if (remaining > 0) lockActive.set(key, remaining);
+    else lockActive.delete(key);
     // 微任务后若链尾没有变化（没有后来者替换它），回收该 key
     const current = queued;
     queueMicrotask(() => {
@@ -125,4 +131,18 @@ async function query(text, params) {
   return pool.query(text, params);
 }
 
-module.exports = { pool, query, withTransaction, withKeyLock, withExhibitTransaction, withExhibitsTransaction, withOrderedKeyTransaction };
+/** 测试辅助：某键当前临界区数量（含持锁者与排队者）。 */
+function keyLockQueueSize(key) {
+  return lockActive.get(key) || 0;
+}
+
+module.exports = {
+  pool,
+  query,
+  withTransaction,
+  withKeyLock,
+  withExhibitTransaction,
+  withExhibitsTransaction,
+  withOrderedKeyTransaction,
+  keyLockQueueSize,
+};

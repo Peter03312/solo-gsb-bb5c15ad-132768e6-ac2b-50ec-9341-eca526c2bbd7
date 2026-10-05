@@ -503,37 +503,14 @@ async function registerResidence(client, { exhibitId, hallId, startMs, endMs }, 
 }
 
 /**
- * 校验并登记一次共享照明（规则 19，由路由在已按序持有展厅锁与各展品行锁的事务内调用）：
- *  - 起点早于终点、结束不晚于当前时间（只登记已发生照明）、实际照度为正、原因必填（400，
- *    路由层先行校验，这里防御性复核）；
- *  - 按与各驻留区间的交集归属各展品并跨自然年拆分；
- *  - 与任一归属展品的未作废实测（含草稿）、停灯、已有照明事故相交 → 整次拒绝（409，
- *    details 按展品分组一次性列出全部冲突，不保存）；
- *  - 无任何展品驻留交集 → 拒绝（409）。
- * 返回 { session, allocations }；allocations 元素
- *   { exhibitId, residenceId, start, end（毫秒）, residenceStart, residenceEnd, yearly }。
+ * 在已持有展厅行锁（及全部归属展品行锁）的事务内，按“登记生效时”的驻留快照切分归属：
+ * 照明窗 ∩ 各驻留区间（端点相接不算），同一展品的相邻驻留各成归属段。
+ * 返回归属段数组（按展品 id、起点、驻留 id 排序）；不做无交集判断（由调用方/登记函数处理）。
+ * 归属必须以本函数在锁内读到的最终驻留集合为准，禁止使用事务外的预读结果。
  */
-async function registerSharedLighting(client, { hallId, startMs, endMs, actualLux, reason }, actor) {
-  if (!(endMs > startMs)) throw new ValidationError('共享照明起点须早于终点');
-  const nowMs = Date.now();
-  if (endMs > nowMs) {
-    throw new ValidationError(
-      `共享照明结束时刻（${tsToWallString(endMs)}）晚于当前时间，只能登记已发生的照明`
-    );
-  }
-  const reasonText = nonEmptyString(reason, '共享照明原因', 1000);
-  const lux = positiveNumber(actualLux, '共享照明实际照度（lx）', { max: 1000000 });
-
+async function collectSharedLightingAllocations(client, { hallId, startMs, endMs }) {
   const sessionSeg = { start: startMs, end: endMs };
   const residenceRows = await getResidencesIntersecting(client, hallId, startMs, endMs);
-  if (residenceRows.length === 0) {
-    throw new ValidationError(
-      `共享照明时段 ${tsToWallString(startMs)} ~ ${tsToWallString(endMs)} ` +
-      '与该展厅任何展品的驻留区间都没有交集，无法归属，已拒绝'
-    );
-  }
-
-  // 归属切分：照明窗 ∩ 各驻留区间（端点相接不算）。同一展品驻留互不重叠。
   const allocations = [];
   for (const res of residenceRows) {
     const resSeg = {
@@ -551,6 +528,47 @@ async function registerSharedLighting(client, { hallId, startMs, endMs, actualLu
     }
   }
   allocations.sort((a, b) => a.exhibitId - b.exhibitId || a.start - b.start || a.residenceId - b.residenceId);
+  return allocations;
+}
+
+/**
+ * 校验并登记一次共享照明（规则 19，由路由在已按序持有展厅锁与各“最终归属”展品行锁的事务内调用）：
+ *  - 起点早于终点、结束不晚于当前时间（只登记已发生照明）、实际照度为正、原因必填（400，
+ *    路由层先行校验，这里防御性复核）；
+ *  - allocations 必须是锁内 collectSharedLightingAllocations 的结果（登记生效时与照明时段
+ *    相交的驻留归属），最终归属展品集合以它为准；未提供时防御性在本事务内重读；
+ *  - 与任一归属展品的未作废实测（含草稿）、停灯、已有照明事故相交 → 整次拒绝（409，
+ *    details 按展品分组一次性列出全部冲突，不保存）；
+ *  - 无任何展品驻留交集 → 拒绝（400）。
+ * 返回 { session, allocations }；allocations 元素
+ *   { exhibitId, residenceId, start, end（毫秒）, residenceStart, residenceEnd, yearly }。
+ */
+async function registerSharedLighting(
+  client,
+  { hallId, startMs, endMs, actualLux, reason, allocations: precomputedAllocations },
+  actor
+) {
+  if (!(endMs > startMs)) throw new ValidationError('共享照明起点须早于终点');
+  const nowMs = Date.now();
+  if (endMs > nowMs) {
+    throw new ValidationError(
+      `共享照明结束时刻（${tsToWallString(endMs)}）晚于当前时间，只能登记已发生的照明`
+    );
+  }
+  const reasonText = nonEmptyString(reason, '共享照明原因', 1000);
+  const lux = positiveNumber(actualLux, '共享照明实际照度（lx）', { max: 1000000 });
+
+  // 归属切分以锁内快照为准：调用方须先在同一事务内取齐全部归属展品锁后再切分；
+  // 未显式传入时防御性重读（仍是本事务快照）。
+  const allocations = precomputedAllocations
+    ? precomputedAllocations
+    : await collectSharedLightingAllocations(client, { hallId, startMs, endMs });
+  if (allocations.length === 0) {
+    throw new ValidationError(
+      `共享照明时段 ${tsToWallString(startMs)} ~ ${tsToWallString(endMs)} ` +
+      '与该展厅任何展品的驻留区间都没有交集，无法归属，已拒绝'
+    );
+  }
 
   // 冲突按展品分组一次性收集：未作废实测（含草稿）、停灯、照明事故
   const byExhibit = new Map();
@@ -3128,6 +3146,7 @@ module.exports = {
   loadResidenceView,
   getResidencesIntersecting,
   registerResidence,
+  collectSharedLightingAllocations,
   getSharedLightingAllocationRows,
   loadSharedLightingView,
   registerSharedLighting,
