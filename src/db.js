@@ -108,21 +108,70 @@ async function withExhibitsTransaction(exhibitIds, work) {
 }
 
 /**
+ * 按给定顺序逐个取得应用层键锁（键序由调用方保证全局一致），全部取得后执行 work。
+ * 与 withKeyLock 不同，这里不去重/不排序——调用方负责给出无环的加锁顺序。
+ */
+async function withKeyLocksOrdered(orderedKeys, work) {
+  const keys = [...new Set(orderedKeys)];
+  const runLocked = (idx) => {
+    if (idx >= keys.length) return work();
+    return withKeyLock(keys[idx], () => runLocked(idx + 1));
+  };
+  return runLocked(0);
+}
+
+/**
  * 按全局键序逐个取得应用层键锁后开事务（用于一次同时涉及展厅与多件展品的操作，
  * 如共享照明登记、跨展厅驻留修改）。键名统一按字典序加锁，避免跨键事务循环等待；
  * 调用方应在 work 内按同一顺序对相应行 SELECT ... FOR UPDATE。
  */
 async function withOrderedKeyTransaction(lockKeys, work) {
   const keys = [...new Set(lockKeys)].sort();
-  const runLocked = (idx) => {
-    if (idx >= keys.length) return withTransaction(work);
-    return withKeyLock(keys[idx], () => runLocked(idx + 1));
-  };
-  return runLocked(0);
+  return withKeyLocksOrdered(keys, () => withTransaction(work));
+}
+
+/**
+ * 展厅 + 展品混合加锁的统一全局键序：**先全部展厅键（按 hallId 升序），
+ * 再全部展品键（按 exhibitId 升序）**。
+ * 共享照明登记只能在进入事务、持有展厅锁之后才能读准“最终归属展品集合”，
+ * 因此展品键必须晚于展厅键获取；驻留的登记/改删与共享照明登记共用此顺序，
+ * 保证两类事务之间不会形成加锁环（死锁）。调用方须在 work 内按同一顺序
+ * 先对展厅行、再对展品行 SELECT ... FOR UPDATE。
+ */
+function hallExhibitLockKeys(hallIds, exhibitIds) {
+  const halls = [...new Set((hallIds || []).map(Number))]
+    .filter((id) => Number.isInteger(id) && id > 0)
+    .sort((a, b) => a - b)
+    .map((id) => `hall:${id}`);
+  const exhibits = [...new Set((exhibitIds || []).map(Number))]
+    .filter((id) => Number.isInteger(id) && id > 0)
+    .sort((a, b) => a - b)
+    .map((id) => `exhibit:${id}`);
+  return [...halls, ...exhibits];
+}
+
+/**
+ * 按给定顺序逐个取得应用层键锁后开事务（键序由调用方负责，必须使用全局一致的
+ * 加锁顺序以避免循环等待）。用于“展厅 + 展品”这类需要固定分组顺序的事务。
+ */
+async function withKeyOrderedTransaction(orderedKeys, work) {
+  const keys = [...new Set(orderedKeys)];
+  return withKeyLocksOrdered(keys, () => withTransaction(work));
 }
 
 async function query(text, params) {
   return pool.query(text, params);
 }
 
-module.exports = { pool, query, withTransaction, withKeyLock, withExhibitTransaction, withExhibitsTransaction, withOrderedKeyTransaction };
+module.exports = {
+  pool,
+  query,
+  withTransaction,
+  withKeyLock,
+  withKeyLocksOrdered,
+  withExhibitTransaction,
+  withExhibitsTransaction,
+  withOrderedKeyTransaction,
+  withKeyOrderedTransaction,
+  hallExhibitLockKeys,
+};

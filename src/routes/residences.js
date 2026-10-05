@@ -16,7 +16,8 @@ const {
   query,
   withTransaction,
   withKeyLock,
-  withOrderedKeyTransaction,
+  withKeyOrderedTransaction,
+  hallExhibitLockKeys,
 } = require('../db');
 const { requireAuth, requireRole } = require('../auth');
 const { recordAudit } = require('../audit');
@@ -157,7 +158,8 @@ router.get('/', async (req, res, next) => {
 
 /**
  * 保管员登记陈列关系（驻留）：展厅首次使用时自动创建展厅；同展品驻留区间不得重叠。
- * 加锁顺序统一为“展厅键 → 展品键”（与共享照明登记一致），避免跨键循环等待。
+ * 加锁顺序统一为“先展厅键 → 再展品键”（全局固定顺序，与共享照明登记一致，
+ * 避免跨键循环等待）；事务内按同一顺序对展厅行、展品行加 SELECT ... FOR UPDATE。
  */
 router.post('/', requireRole('conservator'), async (req, res, next) => {
   try {
@@ -167,7 +169,7 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
     const ex = await query('SELECT id FROM exhibits WHERE id = $1', [input.exhibitId]);
     if (ex.rows.length === 0) throw new ValidationError('展品不存在');
 
-    // 展厅不存在则先在独立事务内创建（创建仅取展厅键，未与展品锁形成交叉）。
+    // 展厅不存在则先在独立事务内创建（创建仅取展厅编码键，未与展品锁形成交叉）。
     let hall = await getHallByCode({ query }, input.hallCode);
     if (!hall) {
       hall = await withKeyLock(`hall:code:${input.hallCode}`, () =>
@@ -186,8 +188,8 @@ router.post('/', requireRole('conservator'), async (req, res, next) => {
       );
     }
 
-    const result = await withOrderedKeyTransaction(
-      [`hall:${hall.id}`, `exhibit:${input.exhibitId}`],
+    const result = await withKeyOrderedTransaction(
+      hallExhibitLockKeys([hall.id], [input.exhibitId]),
       async (client) => {
         await client.query('SELECT id FROM halls WHERE id = $1 FOR UPDATE', [hall.id]);
         await lockExhibit(client, input.exhibitId);
@@ -317,9 +319,14 @@ router.put('/:id', requireRole('conservator'), async (req, res, next) => {
 
     const oldHallId = Number(current.hall_id);
     const newHallId = Number(hall.id);
-    const lockKeys = [...new Set([`hall:${oldHallId}`, `hall:${newHallId}`, `exhibit:${exhibitId}`])];
+    const orderedKeys = hallExhibitLockKeys([oldHallId, newHallId], [exhibitId]);
 
-    const updated = await withOrderedKeyTransaction(lockKeys, async (client) => {
+    const updated = await withKeyOrderedTransaction(orderedKeys, async (client) => {
+      // 先按同一顺序对（新旧）展厅行加锁，再锁展品行。
+      for (const hid of [...new Set([oldHallId, newHallId])].sort((a, b) => a - b)) {
+        await client.query('SELECT id FROM halls WHERE id = $1 FOR UPDATE', [hid]);
+      }
+      await lockExhibit(client, exhibitId);
       const residence = await requireResidence(client, id);
       if (await isResidenceCovered(client, id)) {
         throw new ConflictError(
@@ -374,19 +381,24 @@ router.delete('/:id', requireRole('conservator'), async (req, res, next) => {
     const exhibitId = Number(pre.rows[0].exhibit_id);
     const hallId = Number(pre.rows[0].hall_id);
 
-    await withOrderedKeyTransaction([`hall:${hallId}`, `exhibit:${exhibitId}`], async (client) => {
-      await requireResidence(client, id);
-      if (await isResidenceCovered(client, id)) {
-        throw new ConflictError(
-          `驻留 #${id} 已被共享照明归属覆盖，归属不得回改（不可修改/删除）`,
-          { residenceId: id, coveredByLighting: true }
-        );
+    await withKeyOrderedTransaction(
+      hallExhibitLockKeys([hallId], [exhibitId]),
+      async (client) => {
+        await client.query('SELECT id FROM halls WHERE id = $1 FOR UPDATE', [hallId]);
+        await lockExhibit(client, exhibitId);
+        await requireResidence(client, id);
+        if (await isResidenceCovered(client, id)) {
+          throw new ConflictError(
+            `驻留 #${id} 已被共享照明归属覆盖，归属不得回改（不可修改/删除）`,
+            { residenceId: id, coveredByLighting: true }
+          );
+        }
+        await client.query('DELETE FROM exhibit_residences WHERE id = $1', [id]);
+        await recordAudit(client, req.sessionUser, 'residence.delete', 'exhibit_residence', id, {
+          exhibitId, hallId,
+        });
       }
-      await client.query('DELETE FROM exhibit_residences WHERE id = $1', [id]);
-      await recordAudit(client, req.sessionUser, 'residence.delete', 'exhibit_residence', id, {
-        exhibitId, hallId,
-      });
-    });
+    );
     res.json({ ok: true });
   } catch (err) {
     next(err);

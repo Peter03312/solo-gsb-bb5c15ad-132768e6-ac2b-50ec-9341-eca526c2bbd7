@@ -3139,6 +3139,166 @@ async function runFlow() {
       '账册对照列出封存后新增共享照明来源');
   }
 
+  // ===========================================================================
+  // 共享照明并发修复：预读驻留后、正式归属前有另一笔驻留登记/迁入完成时，
+  // 最终归属必须以“登记生效时（展厅锁内）与照明时段相交的驻留”为准，
+  // 全部归属展品在同一事务内一致入账（占用/预警/超限），不得漏报或留部分记录。
+  // 用路由内部挂点 concurrencyHooks.beforeHallLock 把并发写精确插入到
+  // “事务外预读之后、取得展厅锁正式归属之前”（生产挂点为空操作）。
+  // ===========================================================================
+  {
+    const wallYear = Number(dosing.tsToWall(Date.now()).ymd.slice(0, 4));
+    const yp = wallYear - 1; // 已结束年份（照明必须已发生）
+    const { concurrencyHooks } = require('../src/routes/shared-lightings');
+
+    /**
+     * 发起共享照明登记，并在其“预读后、正式归属前”的挂点处执行 interleave()
+     * （通常是另一笔驻留登记/迁入/迁出）。返回共享照明响应。
+     */
+    async function registerLightingWithInterleave(body, interleave) {
+      let done = false;
+      concurrencyHooks.beforeHallLock = async () => {
+        if (done) return;
+        done = true;
+        await interleave();
+      };
+      try {
+        return await call('POST', '/api/shared-lightings', body, 'c');
+      } finally {
+        concurrencyHooks.beforeHallLock = null;
+      }
+    }
+
+    // ---- 场景 1：预读后迁入新展品（带紧年限）。修复前：照明归属到新展品却不为其
+    // 重算年度占用/超限（漏报）；修复后：新展品在同一事务内一致入账并 409 报超额。 ----
+    const exOld = await createExhibit('并发归属-旧展品');
+    const exNew = await createExhibit('并发归属-迁入展品');
+    await call('POST', `/api/exhibits/${exOld}/limits`, { year: yp, limitLxh: 100000 }, 'c');
+    // 新展品该年上限极低（100），任何归属都必然超限。
+    await call('POST', `/api/exhibits/${exNew}/limits`, { year: yp, limitLxh: 100 }, 'c');
+
+    // 旧展品先驻留 HCONC1（照明窗内）
+    let r = await call('POST', '/api/residences', {
+      exhibitId: exOld, hallCode: 'HCONC1',
+      startDate: `${yp}-06-01`, endDate: `${yp}-06-30`,
+    }, 'c');
+    assert(r.status === 201, '旧展品驻留 HCONC1');
+
+    const slBody = {
+      hallCode: 'HCONC1',
+      startDate: `${yp}-06-10`, startTime: '10:00',
+      endDate: `${yp}-06-10`, endTime: '12:00', // 2h × 200lx = 400 lx·h
+      actualLux: 200, reason: '并发归属照明（迁入）',
+    };
+    const slRes = await registerLightingWithInterleave(slBody, async () => {
+      // 共享照明预读（只看到旧展品）之后、正式归属之前迁入新展品。
+      const mv = await call('POST', '/api/residences', {
+        exhibitId: exNew, hallCode: 'HCONC1',
+        startDate: `${yp}-06-05`, endDate: `${yp}-06-20`,
+      }, 'c');
+      assert(mv.status === 201, '预读后迁入的新驻留登记成功');
+    });
+    assert(slRes.status === 409,
+      `迁入新展品后归属两展品，新展品超限仍入账返回 409（实际 ${slRes.status} ${slRes.body && slRes.body.error}）`);
+    const ovNew = slRes.body.overflows.find((o) => o.exhibitId === exNew && o.year === yp);
+    assert(ovNew && ovNew.excess === 300 && ovNew.projected === 400,
+      `新展品超额 300（400−100）被如实报告，实际=${JSON.stringify(slRes.body.overflows)}`);
+    assert(slRes.body.overflowsByExhibit.some((o) => o.exhibitId === exNew),
+      'overflowsByExhibit 含迁入展品');
+    assert(!slRes.body.overflows.some((o) => o.exhibitId === exOld),
+      '旧展品不超限，不在超额列表');
+
+    // 旧展品不超限，但也必须已一致入账（400）。
+    const dOld = await call('GET', `/api/exhibits/${exOld}`, null, 'c');
+    assert(dOld.body.years[String(yp)].used === 400,
+      `旧展品年度占用 400 已重算，实际=${JSON.stringify(dOld.body.years[String(yp)])}`);
+    // 修复前的核心漏洞：新展品有归属剂量（400），annual_usage 却未更新。
+    const dNew = await call('GET', `/api/exhibits/${exNew}`, null, 'c');
+    assert(dNew.body.sharedLightingDoseYearly[String(yp)] === 400,
+      '迁入展品共享照明按年剂量 400');
+    assert(dNew.body.years[String(yp)] && dNew.body.years[String(yp)].used === 400 &&
+      dNew.body.years[String(yp)].over === true,
+      `迁入展品年度占用已一致重算为 400 且标超限（漏报修复），实际=${JSON.stringify(dNew.body.years[String(yp)])}`);
+    // 共享照明列表也应能按新展品查到归属。
+    const listNew = await call('GET', `/api/shared-lightings?exhibitId=${exNew}`, null, 'c');
+    assert(listNew.body.sharedLightings.length === 1 &&
+      listNew.body.sharedLightings[0].yearly[String(yp)] === 400,
+      '迁入展品可查到本次共享照明归属');
+
+    // ---- 场景 2：预读后迁入的新展品存在冲突（草稿实测）→ 整次拒绝、不留任何部分记录。 ----
+    const exOld2 = await createExhibit('并发冲突-旧展品');
+    const exNew2 = await createExhibit('并发冲突-迁入展品');
+    await call('POST', `/api/exhibits/${exNew2}/limits`, { year: yp, limitLxh: 100000 }, 'c');
+    const planNew2 = await submitPlan(exNew2, '迁入展品计划',
+      `${yp}-06-10`, `${yp}-06-10`, ['09:00-17:00'], 100);
+    await approvePlan(planNew2);
+    await call('POST', '/api/residences', {
+      exhibitId: exOld2, hallCode: 'HCONC2',
+      startDate: `${yp}-06-01`, endDate: `${yp}-06-30`,
+    }, 'c');
+
+    const slRes2 = await registerLightingWithInterleave({
+      hallCode: 'HCONC2',
+      startDate: `${yp}-06-10`, startTime: '10:00',
+      endDate: `${yp}-06-10`, endTime: '12:00',
+      actualLux: 200, reason: '并发归属照明（冲突）',
+    }, async () => {
+      // 迁入新展品驻留，并在其计划窗内放一条与照明相交的草稿实测。
+      const mv = await call('POST', '/api/residences', {
+        exhibitId: exNew2, hallCode: 'HCONC2',
+        startDate: `${yp}-06-05`, endDate: `${yp}-06-20`,
+      }, 'c');
+      assert(mv.status === 201, '预读后迁入新展品驻留');
+      const draft = await call('POST', '/api/measurements', {
+        planId: planNew2,
+        startDate: `${yp}-06-10`, startTime: '11:00',
+        endDate: `${yp}-06-10`, endTime: '11:30', actualLux: 120,
+      }, 'c');
+      assert(draft.status === 201, '迁入展品草稿实测录入');
+    });
+    assert(slRes2.status === 409,
+      `迁入新展品有冲突时整次拒绝 409（实际 ${slRes2.status} ${slRes2.body && slRes2.body.error}）`);
+    assert(slRes2.body.details &&
+      slRes2.body.details.conflictsByExhibit[String(exNew2)] &&
+      slRes2.body.details.conflictsByExhibit[String(exNew2)].overlappingMeasurements.length === 1,
+      '冲突按迁入展品分组列出');
+
+    // 整次不留部分记录：两件展品都查不到共享照明归属。
+    for (const exId of [exOld2, exNew2]) {
+      const lst = await call('GET', `/api/shared-lightings?exhibitId=${exId}`, null, 'c');
+      assert(lst.body.sharedLightings.length === 0,
+        `冲突整次拒绝：展品 ${exId} 无任何共享照明归属残留`);
+    }
+    const dOld2 = await call('GET', `/api/exhibits/${exOld2}`, null, 'c');
+    assert((dOld2.body.years[String(yp)] || {}).used !== 400 &&
+      (dOld2.body.sharedLightingDoseYearly[String(yp)] || 0) === 0,
+      '冲突整次拒绝：旧展品占用未被部分写入');
+
+    // ---- 场景 3：预读后旧驻留被删除（迁出）→ 生效时无交集，整次拒绝（400）。 ----
+    const exMove = await createExhibit('并发迁出-旧展品');
+    await call('POST', '/api/residences', {
+      exhibitId: exMove, hallCode: 'HCONC3',
+      startDate: `${yp}-06-01`, endDate: `${yp}-06-30`,
+    }, 'c');
+    const listRes = await call('GET', `/api/residences?exhibitId=${exMove}`, null, 'c');
+    const resId = listRes.body.residences[0].id;
+
+    const slRes3 = await registerLightingWithInterleave({
+      hallCode: 'HCONC3',
+      startDate: `${yp}-06-10`, startTime: '10:00',
+      endDate: `${yp}-06-10`, endTime: '12:00',
+      actualLux: 200, reason: '并发归属照明（迁出）',
+    }, async () => {
+      const del = await call('DELETE', `/api/residences/${resId}`, null, 'c');
+      assert(del.status === 200, '预读后驻留被删除（迁出）');
+    });
+    assert(slRes3.status === 400 && /没有交集/.test(slRes3.body.error),
+      `生效时无驻留交集 → 400 拒绝（实际 ${slRes3.status} ${slRes3.body && slRes3.body.error}）`);
+    // 迁出后无归属、无照明记录残留。
+    const lst3 = await call('GET', '/api/shared-lightings?hallCode=HCONC3', null, 'c');
+    assert(lst3.body.sharedLightings.length === 0, '迁出无交集：无共享照明记录残留');
+  }
+
   // =======================================================================
   // 年度用光分级预警（阈值基线 / 边沿触发 / 回落重触发 / 无上限 / 跨年 / 回滚 / 已读）
   // =======================================================================
